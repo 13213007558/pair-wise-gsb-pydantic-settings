@@ -2,23 +2,29 @@ from __future__ import annotations as _annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import re
 import threading
 import warnings
 from argparse import Namespace
+from collections import deque
 from collections.abc import Mapping
+from enum import Enum
 from types import SimpleNamespace
-from typing import Any, ClassVar, Literal, TextIO, TypeVar, cast
+from typing import Any, ClassVar, Literal, TextIO, TypeVar, cast, get_args, get_origin
 from weakref import WeakKeyDictionary
 
-from pydantic import ConfigDict
+from pydantic import AliasChoices, AliasPath, ConfigDict, Json, RootModel, TypeAdapter, ValidationError
 from pydantic._internal._config import config_keys
 from pydantic._internal._signature import _field_name_for_signature
 from pydantic._internal._utils import deep_update, is_model_class
 from pydantic.dataclasses import is_pydantic_dataclass
+from pydantic.fields import FieldInfo
 from pydantic.main import BaseModel
+from pydantic.types import _SecretBase
 from typing_extensions import Self
+from typing_inspection.introspection import is_union_origin
 
 from .exceptions import SettingsError
 from .sources import (
@@ -43,8 +49,18 @@ from .sources import (
     YamlConfigSettingsSource,
     get_subcommand,
 )
-from .sources.utils import InitState, _get_alias_names, _warn_if_field_info_incomplete
-from .utils import _settings_debug_enabled, logger
+from .sources.utils import (
+    InitState,
+    _annotation_is_complex,
+    _get_alias_names,
+    _get_field_metadata,
+    _get_model_fields,
+    _resolve_type_alias,
+    _strip_annotated,
+    _warn_if_field_info_incomplete,
+    parse_env_vars,
+)
+from .utils import _lenient_issubclass, _settings_debug_enabled, logger
 
 T = TypeVar('T')
 
@@ -147,6 +163,232 @@ class SettingsConfigDict(ConfigDict, total=False):
 # `config_keys`, they will be considered as valid config keys and will be collected
 # by Pydantic.
 config_keys |= set(SettingsConfigDict.__annotations__.keys())
+
+
+def _is_secret_annotation(annotation: Any) -> bool:
+    """Whether an annotation is, or contains, a pydantic secret type (e.g. `SecretStr`)."""
+    if _lenient_issubclass(annotation, _SecretBase) or _lenient_issubclass(get_origin(annotation), _SecretBase):
+        return True
+    return any(_is_secret_annotation(arg) for arg in get_args(annotation))
+
+
+def _field_alias_path(field_info: FieldInfo) -> tuple[str | int, ...] | None:
+    """Return the multi-segment `AliasPath` a field is validated from, if any.
+
+    Only the path that `EnvSettingsSource` would read first is considered: a bare
+    `AliasPath`, or the first choice of `AliasChoices` when it is a path.
+    """
+    v_alias = field_info.validation_alias
+    path: tuple[str | int, ...] | None = None
+    if isinstance(v_alias, AliasPath):
+        path = tuple(v_alias.path)
+    elif isinstance(v_alias, AliasChoices) and v_alias.choices and isinstance(v_alias.choices[0], AliasPath):
+        path = tuple(v_alias.choices[0].path)
+    return path if path is not None and len(path) > 1 else None
+
+
+def _wrap_alias_path_value(segments: tuple[str | int, ...], value: Any) -> Any:
+    """Nest ``value`` inside dicts/lists so that navigating ``segments`` yields it back."""
+    if not segments:
+        return value
+    head, rest = segments[0], segments[1:]
+    if isinstance(head, int):
+        items: list[Any] = [None] * (head + 1)
+        items[head] = _wrap_alias_path_value(rest, value)
+        return items
+    return {head: _wrap_alias_path_value(rest, value)}
+
+
+def _env_dump_scalar(value: Any) -> str:
+    """Encode a scalar value as the string an `EnvSettingsSource` parses back to an equal value."""
+    if isinstance(value, Enum):
+        enum_value = value.value
+        return enum_value if isinstance(enum_value, str) else str(enum_value)
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode()
+    return str(value)
+
+
+def _mapping_value_annotation(annotation: Any) -> Any:
+    """Return the value type of a mapping annotation, or `Any` when it cannot be determined."""
+    annotation = _strip_annotated(_resolve_type_alias(annotation))
+    if is_union_origin(get_origin(annotation)):
+        args = [arg for arg in get_args(annotation) if arg is not type(None)]
+        annotation = args[0] if len(args) == 1 else Any
+    mapping_args = get_args(annotation)
+    return mapping_args[1] if len(mapping_args) == 2 else Any
+
+
+def _field_values_equal(original: Any, rebuilt: Any) -> bool:
+    return type(original) is type(rebuilt) and original == rebuilt
+
+
+class _EnvDumper:
+    """Serializes a `BaseSettings` instance into environment variables.
+
+    See `BaseSettings.model_dump_env` for the user-facing documentation.
+    """
+
+    def __init__(self, settings: BaseSettings, include_secrets: bool) -> None:
+        self.settings = settings
+        self.include_secrets = include_secrets
+        settings_cls = type(settings)
+        self.source = EnvSettingsSource(settings_cls)
+        # Nested field names never carry the settings-level env prefix.
+        self.nested_source = EnvSettingsSource(settings_cls, env_prefix='')
+        self.delimiter = self.source.env_nested_delimiter
+        self.result: dict[str, str] = {}
+        self.owners: dict[str, str] = {}
+
+    def dump(self) -> dict[str, str]:
+        for field_name, field_info in type(self.settings).model_fields.items():
+            _warn_if_field_info_incomplete(field_info, field_name, {})
+            if field_info.exclude:
+                continue
+            if not self.include_secrets and _is_secret_annotation(field_info.annotation):
+                continue
+            env_name = self._env_name(self.source, field_name, field_info)
+            value = getattr(self.settings, field_name)
+            alias_path = _field_alias_path(field_info)
+            if alias_path is not None:
+                self._dump_alias_path(env_name, alias_path, value, field_name)
+            else:
+                self._dump_value(env_name, field_info, field_info.annotation, value, field_name, depth=0)
+        return self.result
+
+    def _emit(self, env_name: str, value: str, owner: str) -> None:
+        previous = self.owners.get(env_name)
+        if previous is not None:
+            raise SettingsError(
+                f'cannot dump settings to environment variables: {env_name!r} is required by both '
+                f'{previous!r} and {owner!r}; rename one of the conflicting fields or aliases'
+            )
+        self.owners[env_name] = owner
+        self.result[env_name] = value
+
+    @staticmethod
+    def _env_name(source: EnvSettingsSource, field_name: str, field_info: FieldInfo) -> str:
+        return source._extract_field_info(field_info, field_name)[0][1]
+
+    def _dump_none(self, env_name: str, owner: str) -> None:
+        none_str = self.source.env_parse_none_str
+        if none_str is not None:
+            self._emit(env_name, none_str, owner)
+        # Without `env_parse_none_str`, `None` cannot be told apart from "not set" by a
+        # child process, so the variable is omitted and the field keeps its default.
+
+    def _dump_alias_path(self, env_name: str, alias_path: tuple[str | int, ...], value: Any, owner: str) -> None:
+        if value is None:
+            self._dump_none(env_name, owner)
+            return
+        wrapped = _wrap_alias_path_value(alias_path[1:], self._jsonable(value))
+        self._emit(env_name, json.dumps(wrapped), owner)
+
+    def _dump_value(
+        self,
+        env_name: str,
+        field_info: FieldInfo | None,
+        annotation: Any,
+        value: Any,
+        owner: str,
+        depth: int,
+    ) -> None:
+        if isinstance(value, _SecretBase):
+            # Only reachable when `include_secrets` is set; secret fields are filtered out otherwise.
+            value = value.get_secret_value()
+        if value is None:
+            self._dump_none(env_name, owner)
+            return
+        if field_info is not None:
+            is_complex, _ = self.source._field_is_complex(field_info)
+            needs_json_string = any(isinstance(md, Json) for md in _get_field_metadata(field_info))  # type: ignore[misc]
+        else:
+            is_complex = _annotation_is_complex(annotation, [], {})
+            needs_json_string = False
+        if needs_json_string:
+            self._emit(env_name, json.dumps(self._jsonable(value)), owner)
+        elif is_complex:
+            if self._can_explode(value, depth):
+                self._explode(env_name, annotation, value, owner, depth)
+            else:
+                self._emit(env_name, json.dumps(self._jsonable(value)), owner)
+        else:
+            self._emit(env_name, _env_dump_scalar(value), owner)
+
+    def _can_explode(self, value: Any, depth: int) -> bool:
+        if not self.delimiter:
+            return False
+        max_split = self.source.env_nested_max_split
+        if max_split is not None and depth + 1 > max_split:
+            return False
+        if isinstance(value, BaseModel):
+            return not isinstance(value, RootModel) and bool(type(value).model_fields)
+        if is_pydantic_dataclass(type(value)):
+            return bool(getattr(type(value), '__pydantic_fields__', {}))
+        return isinstance(value, Mapping) and len(value) > 0
+
+    def _explode(self, env_name: str, annotation: Any, value: Any, owner: str, depth: int) -> None:
+        assert self.delimiter is not None
+        if isinstance(value, Mapping):
+            value_annotation = _mapping_value_annotation(annotation)
+            for key, item in value.items():
+                self._dump_value(
+                    f'{env_name}{self.delimiter}{key}', None, value_annotation, item, f'{owner}[{key!r}]', depth + 1
+                )
+            return
+        for sub_name, sub_info in _get_model_fields(type(value)).items():
+            if sub_info.exclude:
+                continue
+            if not self.include_secrets and _is_secret_annotation(sub_info.annotation):
+                continue
+            sub_value = getattr(value, sub_name)
+            sub_env_name = self._env_name(self.nested_source, sub_name, sub_info)
+            sub_owner = f'{owner}.{sub_name}'
+            full_env_name = f'{env_name}{self.delimiter}{sub_env_name}'
+            alias_path = _field_alias_path(sub_info)
+            if alias_path is not None:
+                self._dump_alias_path(full_env_name, alias_path, sub_value, sub_owner)
+            else:
+                self._dump_value(full_env_name, sub_info, sub_info.annotation, sub_value, sub_owner, depth + 1)
+
+    def _jsonable(self, value: Any) -> Any:
+        """Convert ``value`` to a JSON-compatible structure keyed by validation aliases."""
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, _SecretBase):
+            # Only reachable when `include_secrets` is set; secret fields are filtered out otherwise.
+            return self._jsonable(value.get_secret_value())
+        if isinstance(value, RootModel):
+            return self._jsonable(value.root)
+        if isinstance(value, BaseModel) or is_pydantic_dataclass(type(value)):
+            result: dict[str, Any] = {}
+            for sub_name, sub_info in _get_model_fields(type(value)).items():
+                if sub_info.exclude:
+                    continue
+                if not self.include_secrets and _is_secret_annotation(sub_info.annotation):
+                    continue
+                sub_value = self._jsonable(getattr(value, sub_name))
+                alias_path = _field_alias_path(sub_info)
+                if alias_path is not None:
+                    result = deep_update(result, _wrap_alias_path_value(alias_path, sub_value))
+                else:
+                    alias_names, _ = _get_alias_names(sub_name, sub_info)
+                    result[alias_names[0] if alias_names else sub_name] = sub_value
+            return result
+        if isinstance(value, Mapping):
+            return {key: self._jsonable(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple, set, frozenset, deque)):
+            return [self._jsonable(item) for item in value]
+        try:
+            return TypeAdapter(type(value)).dump_python(value, mode='json')
+        except Exception:
+            return str(value)
 
 
 class BaseSettings(BaseModel):
@@ -325,6 +567,83 @@ class BaseSettings(BaseModel):
         """
         with _settings_cache_guard:
             _settings_cache.pop(cls, None)
+
+    def model_dump_env(self, *, include_secrets: bool = False) -> dict[str, str]:
+        """Dump the settings instance as a mapping of environment variable names to values.
+
+        The mapping can be exported in another process (via `os.environ` or a `.env` file)
+        to rebuild an equivalent instance using only an `EnvSettingsSource`.
+
+        - Variable names follow the class `model_config`: `env_prefix` (and
+          `env_prefix_target`), validation aliases, `case_sensitive`, and
+          `env_nested_delimiter`. Nested models and mappings are exploded into
+          delimiter-separated variables when a delimiter is configured; other complex
+          values are JSON-encoded, which `EnvSettingsSource` decodes back.
+        - `None` is encoded with `env_parse_none_str` when configured (otherwise the
+          variable is omitted and the field falls back to its default). Empty strings and
+          empty containers keep their meaning, and enums are encoded by value.
+        - Secret fields (`SecretStr`, `SecretBytes`, `Secret[...]`) are omitted unless
+          `include_secrets` is set.
+
+        Args:
+            include_secrets: Whether to export secret field values. Defaults to `False`,
+                meaning secrets are omitted and must be provided by the target process.
+
+        Returns:
+            A mapping of environment variable names to their string values.
+
+        Raises:
+            SettingsError: If two fields (or aliases) map to the same environment
+                variable name.
+        """
+        return _EnvDumper(self, include_secrets).dump()
+
+    def model_dump_env_check(self, *, include_secrets: bool = False) -> list[str]:
+        """Return the names of fields that would not survive a `model_dump_env` round trip.
+
+        The instance is rebuilt from its own `model_dump_env()` mapping using only an
+        `EnvSettingsSource` (no init kwargs, dotenv, file secrets, or custom sources), and
+        each field's type and value is compared with the original. Fields that differ - for
+        example because a validator is not idempotent, a custom source produced a value that
+        cannot be represented as an environment variable, or `None` cannot be encoded
+        without `env_parse_none_str` - are listed instead of claiming the dump is lossless.
+
+        Args:
+            include_secrets: Forwarded to `model_dump_env`. When `False` (default), secret
+                fields are omitted from the dump and are reported here unless their default
+                happens to match.
+
+        Returns:
+            A sorted list of field names that do not round trip; empty when the dump is
+            lossless.
+        """
+        settings_cls = type(self)
+        env_vars = self.model_dump_env(include_secrets=include_secrets)
+        source = EnvSettingsSource(settings_cls)
+        source.env_vars = parse_env_vars(
+            env_vars, source.case_sensitive, source.env_ignore_empty, source.env_parse_none_str
+        )
+        data = source()
+        try:
+            rebuilt = settings_cls.model_validate(data)
+        except ValidationError as exc:
+            name_by_alias: dict[str, str] = {}
+            for field_name, field_info in settings_cls.model_fields.items():
+                for alias in _get_alias_names(field_name, field_info)[0]:
+                    name_by_alias[alias] = field_name
+                name_by_alias[field_name] = field_name
+            return sorted(
+                {
+                    name_by_alias.get(str(error['loc'][0]), str(error['loc'][0]))
+                    for error in exc.errors()
+                    if error['loc']
+                }
+            )
+        return sorted(
+            field_name
+            for field_name in settings_cls.model_fields
+            if not _field_values_equal(getattr(self, field_name), getattr(rebuilt, field_name))
+        )
 
     @classmethod
     def settings_customise_sources(

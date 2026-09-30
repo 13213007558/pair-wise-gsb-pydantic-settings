@@ -837,6 +837,54 @@ print(Settings().model_dump())
 1. The `numbers1` field is not annotated with `ForceDecode`, so it will not be parsed as JSON.
    and we have to provide a custom validator to parse the value.
 
+## Exporting settings to environment variables
+
+A validated settings instance can be handed off to another process (e.g. a container or a
+subprocess) purely through environment variables with `model_dump_env`. The returned mapping
+follows the class configuration: `env_prefix` (and `env_prefix_target`), validation aliases,
+`case_sensitive`, and `env_nested_delimiter`. Complex values are encoded exactly the way
+`EnvSettingsSource` decodes them, so exporting the mapping in the target process rebuilds an
+equivalent instance.
+
+```py
+from pydantic import BaseModel, SecretStr
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class SubModel(BaseModel):
+    val: int = 0
+    flag: bool = False
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix='APP_', env_nested_delimiter='__')
+
+    name: str = 'myapp'
+    nested_model: SubModel = SubModel()
+    tags: list[str] = ['a', 'b']
+    api_key: SecretStr = SecretStr('secret')
+
+
+settings = Settings()
+print(settings.model_dump_env())
+#> {'app_name': 'myapp', 'app_nested_model__val': '0', 'app_nested_model__flag': 'false', 'app_tags': '["a", "b"]'}
+
+# Secrets are omitted by default and must be opted into explicitly.
+print(settings.model_dump_env(include_secrets=True)['app_api_key'])
+#> secret
+
+# Fields that would not survive an environment-only round trip (e.g. because of a
+# non-idempotent validator) are listed instead of claiming the dump is lossless.
+print(settings.model_dump_env_check())
+#> []
+```
+
+`None` values are encoded with `env_parse_none_str` when it is configured; otherwise the
+corresponding variable is omitted and the field falls back to its default in the target
+process. If two fields or aliases resolve to the same variable name, `model_dump_env` raises
+a `SettingsError` instead of silently picking one.
+
 ## Nested model default partial updates
 
 By default, Pydantic settings does not allow partial updates to nested model default objects. This behavior can be
