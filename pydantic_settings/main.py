@@ -20,6 +20,8 @@ from pydantic.dataclasses import is_pydantic_dataclass
 from pydantic.main import BaseModel
 from typing_extensions import Self
 
+from .env_dump import model_dump_env as _model_dump_env
+from .env_dump import verify_env_dump as _verify_env_dump
 from .exceptions import SettingsError
 from .sources import (
     ENV_FILE_SENTINEL,
@@ -349,6 +351,52 @@ class BaseSettings(BaseModel):
             A tuple containing the sources and their order for loading the settings values.
         """
         return init_settings, env_settings, dotenv_settings, file_secret_settings
+    def model_dump_env(self, *, include_secrets: bool = False, verify: bool = False) -> dict[str, str]:
+        """Dump the current settings values as a mapping of environment variable names to values.
+
+        The returned mapping can be handed to another process (e.g. via `subprocess`), where
+        constructing the same settings class with only the environment source reproduces this
+        instance's values. Variable names follow the class configuration: `env_prefix` (and
+        `env_prefix_target`), field aliases, `case_sensitive` and `env_nested_delimiter`.
+
+        Values are encoded so that `EnvSettingsSource` can read them back:
+
+        * complex values (models, mappings, sequences, ...) are JSON encoded;
+        * nested models are exploded with `env_nested_delimiter` when one is configured;
+        * `None` is written as `env_parse_none_str` when configured, otherwise the variable
+          is omitted (and the field default applies when reloading);
+        * enums are written as their member name when `env_parse_enums` is enabled, otherwise
+          as their value;
+        * empty strings and empty containers keep their meaning (`''`, `'{}'`, `'[]'`).
+
+        Secret fields (`SecretStr`, `SecretBytes`, `Secret[...]`, ...) are omitted unless
+        `include_secrets` is `True`.
+
+        Args:
+            include_secrets: Whether to include secret field values in the dump. Defaults to `False`.
+            verify: Whether to reload the dump in an isolated subprocess and check that every dumped
+                field is reproduced with the same type and value. Defaults to `False`.
+
+        Returns:
+            A mapping of environment variable names to their (string) values.
+
+        Raises:
+            SettingsError: If two fields map to the same environment variable name.
+            SettingsError: If `verify` is `True` and some fields cannot be reproduced from the
+                dumped variables (e.g. because of a custom settings source or a non-idempotent
+                validator); the error lists those fields rather than claiming a lossless dump.
+                Verification requires the settings class to be defined at the top level of an
+                importable module.
+        """
+        env_dump, compared_fields = _model_dump_env(self, include_secrets=include_secrets)
+        if verify:
+            non_reversible = _verify_env_dump(self, env_dump, compared_fields)
+            if non_reversible:
+                raise SettingsError(
+                    'the settings instance cannot be fully reproduced from the dumped environment '
+                    f'variables; non-reversible fields: {", ".join(non_reversible)}'
+                )
+        return env_dump
 
     @classmethod
     def _settings_init_sources(

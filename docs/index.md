@@ -3800,3 +3800,47 @@ Rebinding the reference is atomic, so concurrent readers always observe a fully-
 [in-place reloading](#in-place-reloading) (`settings.__init__()`) mutates the object while it runs, so a coroutine that
 reads the settings during a reload may see partially-updated state; if you rely on it, guard both the reload and every
 read with application-level locking.
+## Exporting settings to environment variables
+
+Use `model_dump_env()` to turn a live settings instance into a mapping of environment variables that can be
+handed to another process (e.g. via `subprocess`), where the same settings class can be reconstructed from
+the environment alone. Variable names follow the class configuration: `env_prefix` (and `env_prefix_target`),
+field aliases, `case_sensitive` and `env_nested_delimiter`.
+
+```py
+from pydantic import BaseModel
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Database(BaseModel):
+    host: str = 'localhost'
+    port: int = 5432
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix='myapp_', env_nested_delimiter='__')
+
+    debug: bool = False
+    db: Database = Database()
+
+
+settings = Settings(debug=True, db=Database(host='db.internal', port=6543))
+print(settings.model_dump_env())
+#> {'myapp_debug': 'true', 'myapp_db__host': 'db.internal', 'myapp_db__port': '6543'}
+```
+
+Values are encoded so that `EnvSettingsSource` can read them back: complex values are JSON encoded, nested
+models are exploded with `env_nested_delimiter` when one is configured, `None` is written as
+`env_parse_none_str` when configured (otherwise the variable is omitted), enums are written as their member
+name when `env_parse_enums` is enabled, and empty strings and empty containers keep their meaning.
+
+Secret fields (`SecretStr`, `SecretBytes`, ...) are omitted unless `include_secrets=True` is passed. A
+`SettingsError` is raised before returning if two fields map to the same environment variable name.
+
+Pass `verify=True` to reload the dump in an isolated subprocess (with the rest of the environment cleared and
+all other settings sources disabled) and compare the type and value of every dumped field with the original
+instance. If a field cannot be reproduced — for example because a custom settings source or a non-idempotent
+validator transforms it — a `SettingsError` listing those fields is raised instead of silently claiming a
+lossless dump. Verification requires the settings class to be defined at the top level of an importable
+module.
